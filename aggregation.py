@@ -22,8 +22,8 @@ import torch.nn.functional as F
 
 
 def selected_layer_indices(n_layers: int) -> list[int]:
-    """Return stable early, mid, and late layer indices for a hidden-state stack."""
-    candidates = [n_layers - 1, n_layers - 2, n_layers // 2, n_layers // 4]
+    """Return stable late-layer indices for a hidden-state stack."""
+    candidates = [n_layers - 1, n_layers - 4, n_layers - 8]
     indices: list[int] = []
     for idx in candidates:
         idx = max(0, min(n_layers - 1, idx))
@@ -67,14 +67,16 @@ def aggregate(
 
     real_positions, last_pos = real_token_slice(attention_mask)
     real_positions = real_positions.to(hidden_states.device)
-    tail_positions = real_positions[-16:]
+    tail8_positions = real_positions[-8:]
+    tail32_positions = real_positions[-32:]
 
     features = []
     for layer_idx in selected_layer_indices(hidden_states.size(0)):
         layer = hidden_states[layer_idx].float()
         last_token = layer[last_pos]
-        tail_mean = layer[tail_positions].mean(dim=0)
-        features.extend([last_token, tail_mean])
+        tail8_mean = layer[tail8_positions].mean(dim=0)
+        tail32_mean = layer[tail32_positions].mean(dim=0)
+        features.extend([last_token, tail8_mean, tail32_mean, last_token - tail8_mean])
 
     return torch.cat(features, dim=0)
     # ------------------------------------------------------------------
@@ -109,17 +111,27 @@ def extract_geometric_features(
 
     real_positions, last_pos = real_token_slice(attention_mask)
     real_positions = real_positions.to(hidden_states.device)
-    tail_positions = real_positions[-16:]
+    tail8_positions = real_positions[-8:]
+    tail32_positions = real_positions[-32:]
     selected = selected_layer_indices(hidden_states.size(0))
 
     real_len = float(real_positions.numel())
     seq_len = float(attention_mask.numel())
+    is_truncated = float(real_positions.numel() == attention_mask.numel())
     features = [
         torch.tensor(
             real_len / max(seq_len, 1.0),
             dtype=torch.float32,
             device=hidden_states.device,
-        )
+        ),
+        torch.tensor(
+            is_truncated,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.log1p(
+            torch.tensor(real_len, dtype=torch.float32, device=hidden_states.device)
+        ),
     ]
 
     last_vectors = []
@@ -127,11 +139,28 @@ def extract_geometric_features(
         layer = hidden_states[layer_idx, real_positions].float()
         full_layer = hidden_states[layer_idx].float()
         last_token = full_layer[last_pos]
-        tail_mean = full_layer[tail_positions].mean(dim=0)
+        tail8 = full_layer[tail8_positions]
+        tail32 = full_layer[tail32_positions]
+        tail8_mean = tail8.mean(dim=0)
+        tail32_mean = tail32.mean(dim=0)
+        full_mean = layer.mean(dim=0)
+        token_norms = layer.norm(dim=1)
+        tail8_norms = tail8.norm(dim=1)
+        tail32_norms = tail32.norm(dim=1)
 
-        features.append(layer.norm(dim=1).mean())
+        features.append(token_norms.mean())
+        features.append(token_norms.std(unbiased=False))
         features.append(last_token.norm())
-        features.append(F.cosine_similarity(last_token, tail_mean, dim=0))
+        features.append(tail8_norms.mean())
+        features.append(tail8_norms.std(unbiased=False))
+        features.append(tail32_norms.mean())
+        features.append(tail32_norms.std(unbiased=False))
+        features.append(F.cosine_similarity(last_token, tail8_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(tail8_mean, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(tail32_mean, full_mean, dim=0))
+        features.append((tail8_mean - full_mean).norm())
+        features.append((tail32_mean - full_mean).norm())
         last_vectors.append(last_token)
 
     for left, right in zip(last_vectors, last_vectors[1:]):
