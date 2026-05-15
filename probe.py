@@ -13,27 +13,24 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.preprocessing import StandardScaler
+import torch.nn.functional as F
 
 
 class HallucinationProbe(nn.Module):
     """Binary classifier that detects hallucinations from hidden-state features.
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    Extends ``torch.nn.Module`` and keeps the public probe API expected by
+    ``evaluate.py``.  The active classifier is a torch-native ensemble of
+    regularized linear probes over scaled PCA and raw feature views.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._pca: PCA | None = None
-        self._linear_probe: LogisticRegression | None = None
-        self._ensemble: list[tuple[PCA | None, LogisticRegression, float]] = []
+        self._mean: torch.Tensor | None = None
+        self._std: torch.Tensor | None = None
+        self._pca_basis: torch.Tensor | None = None
+        self._ensemble: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
         self._train_prior: float = 0.5
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
@@ -76,8 +73,8 @@ class HallucinationProbe(nn.Module):
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
+        Scales features, builds PCA views, and fits a deterministic ensemble of
+        regularized torch linear probes.
 
         Args:
             X: Feature matrix of shape ``(n_samples, feature_dim)``.
@@ -92,13 +89,15 @@ class HallucinationProbe(nn.Module):
 
         y_int = y.astype(int)
         self._train_prior = float(np.mean(y_int)) if len(y_int) else 0.5
-        X_scaled = self._scaler.fit_transform(X)
+        X_t = torch.from_numpy(X.astype(np.float64))
+        self._mean = X_t.mean(dim=0, keepdim=True)
+        self._std = X_t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+        X_scaled = (X_t - self._mean) / self._std
 
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
         self._ensemble = self._fit_logistic_ensemble(X_scaled, y_int)
-        self._linear_probe = self._ensemble[0][1] if self._ensemble else None
         train_probs = self._predict_scaled_proba(X_scaled)
         self._threshold = self._prior_threshold(train_probs, self._train_prior)
         # ------------------------------------------------------------------
@@ -175,86 +174,152 @@ class HallucinationProbe(nn.Module):
 
     def _fit_linear_probe(
         self,
-        X_train: np.ndarray,
+        X_train: torch.Tensor,
         y_train: np.ndarray,
         C: float = 0.25,
-    ) -> LogisticRegression | None:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if len(np.unique(y_train)) < 2:
             return None
-        model = LogisticRegression(
-            C=C,
-            class_weight="balanced",
-            max_iter=2000,
-            random_state=42,
-            solver="liblinear",
+
+        torch.manual_seed(42)
+        X_view = X_train.double()
+        y_t = torch.from_numpy(y_train.astype(np.float64))
+        n_pos = float(y_t.sum().item())
+        n_neg = float(len(y_t) - n_pos)
+        if n_pos == 0.0 or n_neg == 0.0:
+            return None
+
+        sample_weights = torch.where(
+            y_t > 0.5,
+            torch.full_like(y_t, len(y_t) / (2.0 * n_pos)),
+            torch.full_like(y_t, len(y_t) / (2.0 * n_neg)),
         )
-        model.fit(X_train, y_train)
-        return model
+
+        weight = torch.zeros(X_view.shape[1], dtype=torch.float64, requires_grad=True)
+        bias = torch.zeros((), dtype=torch.float64, requires_grad=True)
+        l2_strength = 1.0 / max(C, 1e-6)
+
+        def objective() -> torch.Tensor:
+            logits = X_view @ weight + bias
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                y_t,
+                weight=sample_weights,
+                reduction="mean",
+            )
+            return loss + 0.5 * l2_strength * weight.square().sum() / len(y_t)
+
+        optimizer = torch.optim.LBFGS(
+            [weight, bias],
+            lr=1.0,
+            max_iter=300,
+            history_size=20,
+            line_search_fn="strong_wolfe",
+        )
+
+        try:
+            def closure() -> torch.Tensor:
+                optimizer.zero_grad()
+                loss = objective()
+                loss.backward()
+                return loss
+
+            optimizer.step(closure)
+        except RuntimeError:
+            optimizer = torch.optim.AdamW([weight, bias], lr=0.05, weight_decay=0.0)
+            for _ in range(400):
+                optimizer.zero_grad()
+                loss = objective()
+                loss.backward()
+                optimizer.step()
+
+        return weight.detach(), bias.detach()
 
     def _fit_logistic_ensemble(
         self,
-        X_scaled: np.ndarray,
+        X_scaled: torch.Tensor,
         y_train: np.ndarray,
-    ) -> list[tuple[PCA | None, LogisticRegression, float]]:
+    ) -> list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]]:
         """Fit several regularized logistic probes on stable low-rank views."""
         if len(np.unique(y_train)) < 2:
             return []
 
-        models: list[tuple[PCA | None, LogisticRegression, float]] = []
+        models: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
         max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
         component_grid = [32, 64, 96, 128]
+        max_pca_components = min(max(component_grid), max_components)
+
+        if max_pca_components >= 2:
+            self._pca_basis = self._compute_pca_basis(X_scaled, max_pca_components)
+        else:
+            self._pca_basis = None
 
         for n_components in component_grid:
             if n_components < 2 or n_components > max_components:
                 continue
-            pca = PCA(
-                n_components=n_components,
-                whiten=False,
-                random_state=42 + n_components,
-                svd_solver="randomized",
-            )
-            X_pca = pca.fit_transform(X_scaled)
+            if self._pca_basis is None:
+                continue
+            basis = self._pca_basis[:, :n_components].contiguous()
+            X_pca = X_scaled @ basis
             for C in (0.08, 0.2, 0.5):
-                model = self._fit_linear_probe(X_pca, y_train, C=C)
-                if model is not None:
+                fitted = self._fit_linear_probe(X_pca, y_train, C=C)
+                if fitted is not None:
                     # Lower-dimensional views are less brittle on this small
                     # dataset, so give them a modestly higher vote.
-                    weight = 1.0 / np.sqrt(n_components / component_grid[0])
-                    models.append((pca, model, float(weight)))
+                    vote_weight = 1.0 / np.sqrt(n_components / component_grid[0])
+                    models.append((basis, fitted[0], fitted[1], float(vote_weight)))
 
-        raw_model = self._fit_linear_probe(X_scaled, y_train, C=0.05)
-        if raw_model is not None:
-            models.append((None, raw_model, 0.35))
+        fitted_raw = self._fit_linear_probe(X_scaled, y_train, C=0.05)
+        if fitted_raw is not None:
+            models.append((None, fitted_raw[0], fitted_raw[1], 0.35))
 
         return models
 
+    def _compute_pca_basis(self, X_scaled: torch.Tensor, n_components: int) -> torch.Tensor:
+        X_centered = X_scaled - X_scaled.mean(dim=0, keepdim=True)
+        _, _, vh = torch.linalg.svd(X_centered, full_matrices=False)
+        return vh[:n_components].T.contiguous()
+
     def _predict_transformed_proba(
         self,
-        X_model: np.ndarray,
-        linear_probe: LogisticRegression | None = None,
+        X_model: torch.Tensor,
+        linear_probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> np.ndarray:
         if linear_probe is not None:
-            return linear_probe.predict_proba(X_model)[:, 1]
+            weight, bias = linear_probe
+            return torch.sigmoid(X_model @ weight + bias).numpy()
         return self._predict_scaled_proba(X_model)
 
-    def _predict_scaled_proba(self, X_scaled: np.ndarray) -> np.ndarray:
+    def _predict_scaled_proba(self, X_scaled: torch.Tensor) -> np.ndarray:
         if not self._ensemble:
             return np.full(X_scaled.shape[0], self._train_prior, dtype=float)
 
-        weighted_probs = np.zeros(X_scaled.shape[0], dtype=float)
+        weighted_probs = torch.zeros(X_scaled.shape[0], dtype=torch.float64)
         total_weight = 0.0
-        for pca, model, weight in self._ensemble:
-            X_view = pca.transform(X_scaled) if pca is not None else X_scaled
-            weighted_probs += weight * model.predict_proba(X_view)[:, 1]
-            total_weight += weight
+        for basis, linear_weight, bias, vote_weight in self._ensemble:
+            X_view = X_scaled @ basis if basis is not None else X_scaled
+            weighted_probs += vote_weight * torch.sigmoid(X_view @ linear_weight + bias)
+            total_weight += vote_weight
 
-        return weighted_probs / max(total_weight, 1e-12)
+        return (weighted_probs / max(total_weight, 1e-12)).numpy()
 
     def _prior_threshold(self, probs: np.ndarray, prior: float) -> float:
         if probs.size == 0:
             return 0.5
         prior = float(np.clip(prior, 0.01, 0.99))
         return float(np.quantile(probs, 1.0 - prior))
+
+    def _accuracy(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        return float(np.mean(y_true.astype(int) == y_pred.astype(int)))
+
+    def _f1(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        y_true = y_true.astype(int)
+        y_pred = y_pred.astype(int)
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+        denom = (2 * tp) + fp + fn
+        return float((2 * tp) / denom) if denom else 0.0
 
     def _best_threshold(self, probs: np.ndarray, y_true: np.ndarray) -> float:
         if len(y_true) < 8 or len(np.unique(y_true)) < 2:
@@ -266,23 +331,30 @@ class HallucinationProbe(nn.Module):
         scores: list[tuple[float, float, float]] = []
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
-            acc = accuracy_score(y_true, y_pred_t)
-            f1 = f1_score(y_true, y_pred_t, zero_division=0)
+            acc = self._accuracy(y_true, y_pred_t)
+            f1 = self._f1(y_true, y_pred_t)
             best_accuracy = max(best_accuracy, acc)
             scores.append((float(t), acc, f1))
 
         # Accuracy is the competition metric, but F1 should not be needlessly
         # sacrificed when several thresholds are effectively tied on accuracy.
-        viable = [item for item in scores if item[1] >= best_accuracy - 0.01]
+        # Validation folds are small, so exact max-accuracy thresholds can
+        # overfit by predicting too few positives.  Keep near-optimal accuracy
+        # thresholds and prefer the one that preserves positive-class recall.
+        viable = [item for item in scores if item[1] >= best_accuracy - 0.03]
+        prior_threshold = self._prior_threshold(
+            probs,
+            min(self._train_prior + 0.05, 0.95),
+        )
         best_threshold, _, _ = max(
             viable,
             key=lambda item: (
                 item[2],
                 item[1],
-                -abs(item[0] - self._prior_threshold(probs, float(np.mean(y_true)))),
+                -abs(item[0] - prior_threshold),
             ),
         )
-        return float(best_threshold)
+        return float(min(best_threshold, prior_threshold))
 
     def _augment_minority_class(
         self,
@@ -341,6 +413,9 @@ class HallucinationProbe(nn.Module):
             estimated probability of the hallucinated class (label 1).
             Used to compute AUROC.
         """
-        X_scaled = self._scaler.transform(X)
+        if self._mean is None or self._std is None:
+            raise RuntimeError("Probe has not been fitted yet.")
+        X_t = torch.from_numpy(X.astype(np.float64))
+        X_scaled = (X_t - self._mean) / self._std
         prob_pos = self._predict_scaled_proba(X_scaled)
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
