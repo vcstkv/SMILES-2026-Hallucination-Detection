@@ -22,8 +22,8 @@ import torch.nn.functional as F
 
 
 def selected_layer_indices(n_layers: int) -> list[int]:
-    """Return stable late-layer indices for a hidden-state stack."""
-    candidates = [n_layers - 1, n_layers - 4, n_layers - 8]
+    """Return stable cross-depth layer indices for a hidden-state stack."""
+    candidates = [0, 4, 8, 12, 16, 20, n_layers - 1]
     indices: list[int] = []
     for idx in candidates:
         idx = max(0, min(n_layers - 1, idx))
@@ -38,6 +38,21 @@ def real_token_slice(attention_mask: torch.Tensor) -> tuple[torch.Tensor, int]:
     if real_positions.numel() == 0:
         real_positions = torch.tensor([0], device=attention_mask.device)
     return real_positions, int(real_positions[-1].item())
+
+
+def recency_weighted_mean(layer_tokens: torch.Tensor) -> torch.Tensor:
+    """Pool tokens with a smooth bias toward the answer tail."""
+    if layer_tokens.size(0) == 1:
+        return layer_tokens[0]
+    weights = torch.linspace(
+        0.25,
+        1.0,
+        steps=layer_tokens.size(0),
+        dtype=layer_tokens.dtype,
+        device=layer_tokens.device,
+    )
+    weights = weights / weights.sum().clamp_min(1e-12)
+    return (layer_tokens * weights[:, None]).sum(dim=0)
 
 
 def aggregate(
@@ -73,10 +88,23 @@ def aggregate(
     features = []
     for layer_idx in selected_layer_indices(hidden_states.size(0)):
         layer = hidden_states[layer_idx].float()
+        real_tokens = layer[real_positions]
         last_token = layer[last_pos]
         tail8_mean = layer[tail8_positions].mean(dim=0)
         tail32_mean = layer[tail32_positions].mean(dim=0)
-        features.extend([last_token, tail8_mean, tail32_mean, last_token - tail8_mean])
+        full_mean = real_tokens.mean(dim=0)
+        recency_mean = recency_weighted_mean(real_tokens)
+        features.extend(
+            [
+                last_token,
+                tail8_mean,
+                tail32_mean,
+                full_mean,
+                recency_mean,
+                last_token - tail32_mean,
+                recency_mean - full_mean,
+            ]
+        )
 
     return torch.cat(features, dim=0)
     # ------------------------------------------------------------------
@@ -116,11 +144,11 @@ def extract_geometric_features(
     selected = selected_layer_indices(hidden_states.size(0))
 
     real_len = float(real_positions.numel())
-    seq_len = float(attention_mask.numel())
-    is_truncated = float(real_positions.numel() == attention_mask.numel())
+    max_model_len = 512.0
+    is_truncated = float(real_len >= max_model_len)
     features = [
         torch.tensor(
-            real_len / max(seq_len, 1.0),
+            real_len / max_model_len,
             dtype=torch.float32,
             device=hidden_states.device,
         ),
@@ -131,6 +159,16 @@ def extract_geometric_features(
         ),
         torch.log1p(
             torch.tensor(real_len, dtype=torch.float32, device=hidden_states.device)
+        ),
+        torch.tensor(
+            min(real_len, 8.0) / max(real_len, 1.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.tensor(
+            min(real_len, 32.0) / max(real_len, 1.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
         ),
     ]
 
@@ -144,6 +182,7 @@ def extract_geometric_features(
         tail8_mean = tail8.mean(dim=0)
         tail32_mean = tail32.mean(dim=0)
         full_mean = layer.mean(dim=0)
+        recency_mean = recency_weighted_mean(layer)
         token_norms = layer.norm(dim=1)
         tail8_norms = tail8.norm(dim=1)
         tail32_norms = tail32.norm(dim=1)
@@ -157,10 +196,13 @@ def extract_geometric_features(
         features.append(tail32_norms.std(unbiased=False))
         features.append(F.cosine_similarity(last_token, tail8_mean, dim=0))
         features.append(F.cosine_similarity(last_token, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, recency_mean, dim=0))
         features.append(F.cosine_similarity(tail8_mean, tail32_mean, dim=0))
         features.append(F.cosine_similarity(tail32_mean, full_mean, dim=0))
+        features.append(F.cosine_similarity(recency_mean, full_mean, dim=0))
         features.append((tail8_mean - full_mean).norm())
         features.append((tail32_mean - full_mean).norm())
+        features.append((recency_mean - full_mean).norm())
         last_vectors.append(last_token)
 
     for left, right in zip(last_vectors, last_vectors[1:]):

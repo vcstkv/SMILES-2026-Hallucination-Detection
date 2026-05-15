@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
 
 
 class HallucinationProbe(nn.Module):
@@ -33,6 +34,7 @@ class HallucinationProbe(nn.Module):
         self._ensemble: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
         self._train_prior: float = 0.5
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._oof_threshold: float = 0.5
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
@@ -97,9 +99,9 @@ class HallucinationProbe(nn.Module):
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
+        self._oof_threshold = self._fit_oof_threshold(X_scaled, y_int)
+        self._threshold = self._oof_threshold
         self._ensemble = self._fit_logistic_ensemble(X_scaled, y_int)
-        train_probs = self._predict_scaled_proba(X_scaled)
-        self._threshold = self._prior_threshold(train_probs, self._train_prior)
         # ------------------------------------------------------------------
 
         self.eval()
@@ -246,7 +248,7 @@ class HallucinationProbe(nn.Module):
 
         models: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
         max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
-        component_grid = [32, 64, 96, 128]
+        component_grid = [16, 32, 64, 96, 128, 192, 256]
         max_pca_components = min(max(component_grid), max_components)
 
         if max_pca_components >= 2:
@@ -261,7 +263,7 @@ class HallucinationProbe(nn.Module):
                 continue
             basis = self._pca_basis[:, :n_components].contiguous()
             X_pca = X_scaled @ basis
-            for C in (0.08, 0.2, 0.5):
+            for C in (0.03, 0.06, 0.12, 0.25, 0.5, 1.0):
                 fitted = self._fit_linear_probe(X_pca, y_train, C=C)
                 if fitted is not None:
                     # Lower-dimensional views are less brittle on this small
@@ -269,9 +271,12 @@ class HallucinationProbe(nn.Module):
                     vote_weight = 1.0 / np.sqrt(n_components / component_grid[0])
                     models.append((basis, fitted[0], fitted[1], float(vote_weight)))
 
-        fitted_raw = self._fit_linear_probe(X_scaled, y_train, C=0.05)
-        if fitted_raw is not None:
-            models.append((None, fitted_raw[0], fitted_raw[1], 0.35))
+        # The raw full-dimensional solve is useful for compact features but
+        # expensive and brittle once aggregation exposes many layer views.
+        if X_scaled.shape[1] <= 15000:
+            fitted_raw = self._fit_linear_probe(X_scaled, y_train, C=0.05)
+            if fitted_raw is not None:
+                models.append((None, fitted_raw[0], fitted_raw[1], 0.35))
 
         return models
 
@@ -291,12 +296,24 @@ class HallucinationProbe(nn.Module):
         return self._predict_scaled_proba(X_model)
 
     def _predict_scaled_proba(self, X_scaled: torch.Tensor) -> np.ndarray:
-        if not self._ensemble:
-            return np.full(X_scaled.shape[0], self._train_prior, dtype=float)
+        return self._predict_ensemble_proba(
+            X_scaled,
+            self._ensemble,
+            self._train_prior,
+        )
+
+    def _predict_ensemble_proba(
+        self,
+        X_scaled: torch.Tensor,
+        ensemble: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]],
+        fallback_prior: float,
+    ) -> np.ndarray:
+        if not ensemble:
+            return np.full(X_scaled.shape[0], fallback_prior, dtype=float)
 
         weighted_probs = torch.zeros(X_scaled.shape[0], dtype=torch.float64)
         total_weight = 0.0
-        for basis, linear_weight, bias, vote_weight in self._ensemble:
+        for basis, linear_weight, bias, vote_weight in ensemble:
             X_view = X_scaled @ basis if basis is not None else X_scaled
             weighted_probs += vote_weight * torch.sigmoid(X_view @ linear_weight + bias)
             total_weight += vote_weight
@@ -312,49 +329,95 @@ class HallucinationProbe(nn.Module):
     def _accuracy(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return float(np.mean(y_true.astype(int) == y_pred.astype(int)))
 
-    def _f1(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
-        y_true = y_true.astype(int)
-        y_pred = y_pred.astype(int)
-        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-        denom = (2 * tp) + fp + fn
-        return float((2 * tp) / denom) if denom else 0.0
-
-    def _best_threshold(self, probs: np.ndarray, y_true: np.ndarray) -> float:
+    def _best_threshold(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+        reference_threshold: float | None = None,
+    ) -> float:
         if len(y_true) < 8 or len(np.unique(y_true)) < 2:
             return self._prior_threshold(probs, self._train_prior)
 
         candidates = np.unique(np.concatenate([probs, np.linspace(0.02, 0.98, 97)]))
+        if reference_threshold is None:
+            reference_threshold = self._prior_threshold(probs, self._train_prior)
 
         best_accuracy = -1.0
-        scores: list[tuple[float, float, float]] = []
+        scores: list[tuple[float, float]] = []
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
             acc = self._accuracy(y_true, y_pred_t)
-            f1 = self._f1(y_true, y_pred_t)
             best_accuracy = max(best_accuracy, acc)
-            scores.append((float(t), acc, f1))
+            scores.append((float(t), acc))
 
-        # Accuracy is the competition metric, but F1 should not be needlessly
-        # sacrificed when several thresholds are effectively tied on accuracy.
-        # Validation folds are small, so exact max-accuracy thresholds can
-        # overfit by predicting too few positives.  Keep near-optimal accuracy
-        # thresholds and prefer the one that preserves positive-class recall.
-        viable = [item for item in scores if item[1] >= best_accuracy - 0.03]
-        prior_threshold = self._prior_threshold(
+        best_threshold, _ = max(
+            scores,
+            key=lambda item: (item[1], -abs(item[0] - reference_threshold)),
+        )
+        return float(best_threshold)
+
+    def _fit_oof_threshold(self, X_scaled: torch.Tensor, y_train: np.ndarray) -> float:
+        min_class_count = int(np.bincount(y_train.astype(int), minlength=2).min())
+        n_splits = min(4, min_class_count)
+        if n_splits < 2 or len(y_train) < 8:
+            return 0.5
+
+        oof_probs = np.full(len(y_train), self._train_prior, dtype=float)
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        for inner_train_idx, inner_val_idx in splitter.split(
+            np.arange(len(y_train)),
+            y_train,
+        ):
+            inner_prior = float(np.mean(y_train[inner_train_idx]))
+            inner_ensemble = self._fit_logistic_ensemble(
+                X_scaled[inner_train_idx],
+                y_train[inner_train_idx],
+            )
+            oof_probs[inner_val_idx] = self._predict_ensemble_proba(
+                X_scaled[inner_val_idx],
+                inner_ensemble,
+                inner_prior,
+            )
+
+        prior_threshold = self._prior_threshold(oof_probs, self._train_prior)
+        return self._best_threshold(
+            oof_probs,
+            y_train,
+            reference_threshold=prior_threshold,
+        )
+
+    def _select_validation_threshold(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> float:
+        y_true = y_true.astype(int)
+        prior_threshold = self._prior_threshold(probs, self._train_prior)
+        validation_threshold = self._best_threshold(
             probs,
-            min(self._train_prior + 0.05, 0.95),
+            y_true,
+            reference_threshold=self._oof_threshold,
         )
-        best_threshold, _, _ = max(
-            viable,
-            key=lambda item: (
-                item[2],
-                item[1],
-                -abs(item[0] - prior_threshold),
-            ),
+        candidates = np.array(
+            [
+                self._oof_threshold,
+                validation_threshold,
+                prior_threshold,
+                0.5,
+            ],
+            dtype=float,
         )
-        return float(min(best_threshold, prior_threshold))
+        candidates = np.unique(np.clip(candidates, 0.0, 1.0))
+        scores = [
+            (float(t), self._accuracy(y_true, (probs >= t).astype(int)))
+            for t in candidates
+        ]
+        best_threshold, _ = max(
+            scores,
+            key=lambda item: (item[1], -abs(item[0] - self._oof_threshold)),
+        )
+        return float(best_threshold)
 
     def _augment_minority_class(
         self,
@@ -385,7 +448,7 @@ class HallucinationProbe(nn.Module):
         """
         probs = self.predict_proba(X_val)[:, 1]
 
-        self._threshold = self._best_threshold(probs, y_val.astype(int))
+        self._threshold = self._select_validation_threshold(probs, y_val)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
