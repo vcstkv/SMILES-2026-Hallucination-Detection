@@ -40,6 +40,13 @@ def real_token_slice(attention_mask: torch.Tensor) -> tuple[torch.Tensor, int]:
     return real_positions, int(real_positions[-1].item())
 
 
+def content_token_positions(real_positions: torch.Tensor) -> torch.Tensor:
+    """Return real-token positions excluding the final token when possible."""
+    if real_positions.numel() <= 1:
+        return real_positions
+    return real_positions[:-1]
+
+
 def recency_weighted_mean(layer_tokens: torch.Tensor) -> torch.Tensor:
     """Pool tokens with a smooth bias toward the answer tail."""
     if layer_tokens.size(0) == 1:
@@ -145,10 +152,15 @@ def extract_geometric_features(
 
     real_positions, last_pos = real_token_slice(attention_mask)
     real_positions = real_positions.to(hidden_states.device)
+    content_positions = content_token_positions(real_positions)
+    penultimate_pos = int(content_positions[-1].item())
     tail4_positions = real_positions[-4:]
     tail8_positions = real_positions[-8:]
     tail16_positions = real_positions[-16:]
     tail32_positions = real_positions[-32:]
+    content_tail4_positions = content_positions[-4:]
+    content_tail8_positions = content_positions[-8:]
+    content_tail16_positions = content_positions[-16:]
     selected = selected_layer_indices(hidden_states.size(0))
 
     real_len = float(real_positions.numel())
@@ -188,14 +200,21 @@ def extract_geometric_features(
         layer = hidden_states[layer_idx, real_positions].float()
         full_layer = hidden_states[layer_idx].float()
         last_token = full_layer[last_pos]
+        penultimate_token = full_layer[penultimate_pos]
         tail4 = full_layer[tail4_positions]
         tail8 = full_layer[tail8_positions]
         tail16 = full_layer[tail16_positions]
         tail32 = full_layer[tail32_positions]
+        content_tail4 = full_layer[content_tail4_positions]
+        content_tail8 = full_layer[content_tail8_positions]
+        content_tail16 = full_layer[content_tail16_positions]
         tail4_mean = tail4.mean(dim=0)
         tail8_mean = tail8.mean(dim=0)
         tail16_mean = tail16.mean(dim=0)
         tail32_mean = tail32.mean(dim=0)
+        content_tail4_mean = content_tail4.mean(dim=0)
+        content_tail8_mean = content_tail8.mean(dim=0)
+        content_tail16_mean = content_tail16.mean(dim=0)
         full_mean = layer.mean(dim=0)
         recency_mean = recency_weighted_mean(layer)
         token_norms = layer.norm(dim=1)
@@ -203,6 +222,9 @@ def extract_geometric_features(
         tail8_norms = tail8.norm(dim=1)
         tail16_norms = tail16.norm(dim=1)
         tail32_norms = tail32.norm(dim=1)
+        content_tail4_norms = content_tail4.norm(dim=1)
+        content_tail8_norms = content_tail8.norm(dim=1)
+        content_tail16_norms = content_tail16.norm(dim=1)
 
         features.append(token_norms.mean())
         features.append(token_norms.std(unbiased=False))
@@ -232,6 +254,16 @@ def extract_geometric_features(
         features.append((recency_mean - full_mean).norm())
         features.append((tail4_mean - tail32_mean).norm())
         features.append((last_token - tail4_mean).norm())
+        features.append(penultimate_token.norm())
+        features.append(content_tail4_norms.mean())
+        features.append(content_tail8_norms.mean())
+        features.append(content_tail16_norms.mean())
+        features.append(F.cosine_similarity(penultimate_token, content_tail4_mean, dim=0))
+        features.append(F.cosine_similarity(penultimate_token, content_tail8_mean, dim=0))
+        features.append(F.cosine_similarity(penultimate_token, content_tail16_mean, dim=0))
+        features.append(F.cosine_similarity(content_tail8_mean, full_mean, dim=0))
+        features.append((penultimate_token - content_tail16_mean).norm())
+        features.append((content_tail8_mean - full_mean).norm())
         last_vectors.append(last_token)
 
     for left, right in zip(last_vectors, last_vectors[1:]):

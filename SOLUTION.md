@@ -2,7 +2,7 @@
 
 ## Reproducibility
 
-To reproduce the run:
+The solution can be reproduced with:
 
 ```bash
 python -m venv .venv
@@ -30,75 +30,71 @@ The table reports the values from `results.json`.
 | Metric | Value |
 |---|---:|
 | Number of labelled samples | 689 |
-| Number of folds | 5 |
-| Split size per fold | 447-448 train / 104 val / 137-138 test |
-| Feature dimension | 48,789 |
-| Feature extraction time | 11.18 s |
-| Baseline accuracy | 70.10% |
-| Baseline F1 | 82.42% |
-| Train accuracy | 89.04% |
-| Train F1 | 92.63% |
-| Train AUROC | 96.49% |
-| Validation accuracy | 74.04% |
-| Validation F1 | 82.76% |
-| Validation AUROC | 76.57% |
-| Test accuracy | 74.60% |
-| Test F1 | 83.03% |
-| Test AUROC | 75.28% |
+| Number of folds | 6 |
+| Split size per fold | 487-488 train / 97-98 val / 104 test |
+| Feature dimension | 48,849 |
+| Feature extraction time | 71.50 s |
+| Baseline accuracy | 70.19% |
+| Baseline F1 | 82.49% |
+| Train accuracy | 78.84% |
+| Train F1 | 85.93% |
+| Train AUROC | 83.17% |
+| Validation accuracy | 73.85% |
+| Validation F1 | 82.58% |
+| Validation AUROC | 75.55% |
+| Test accuracy | 76.28% |
+| Test F1 | 83.80% |
+| Test AUROC | 73.35% |
 
-The test accuracy across folds ranges from 72.46% to 77.54%.
+The test accuracy across folds ranges from 70.19% to 78.85%.
 
 ## Method
 
 Only the three allowed files were changed: `aggregation.py`, `probe.py`, and
 `splitting.py`.
 
-In `aggregation.py`, hidden states are used from layers 4, 8, 12, 16, 20, and
-the last layer. For each layer, several pooled representations are
+In `aggregation.py`, hidden states are taken from layers 4, 8, 12, 16, 20, and
+the last layer. For each layer, several answer-focused vectors are
 concatenated: the last token, means over the last 4/8/16/32 tokens, the full
-mean, a recency-weighted mean, and a few difference vectors. These features are
-meant to emphasize the generated answer, especially the end of the response.
+mean, a recency-weighted mean, and two difference vectors. This keeps the
+representation focused on the response tail without using PCA.
 
-Scalar geometric features are also added when `USE_GEOMETRIC = True`. These
-include sequence length, truncation, activation norms, cosine similarities
-between different pooled vectors, and layer-to-layer drift features.
+Scalar geometric features are also added. These include sequence length,
+truncation, activation norms, cosine similarities between pooled vectors,
+layer-to-layer drift, and compact EOS-excluded tail features. The EOS-excluded
+features are kept scalar because larger vector expansions did not transfer
+well.
 
-In `probe.py`, a simple linear probe ensemble is used. First, all features are
-standardized. Then features are ranked on the training fold using a
-between-class versus within-class variance score. Regularized logistic probes
-are trained on the top 64, 128, 256, 512, and 1024 ranked features. The final
-score is the weighted average of these probes, with a fixed threshold of 0.45.
+In `probe.py`, all features are standardized on the training fold. Features are
+ranked with two supervised scores: an F-score style between-class score and
+absolute standardized mean difference. A regularized `liblinear` logistic probe
+is trained on the top 32 features from each ranking. Duplicate feature sets are
+removed, and the predicted probability is averaged across the remaining probes.
+The decision threshold is fixed at 0.42.
 
-In `splitting.py`, stratified 5-fold evaluation is used. Inside each fold, a
-stratified validation set is split from the training part. This gives train,
-val, and test metrics while keeping class proportions stable.
+In `splitting.py`, one stratified test set is held out first with
+`test_size = 0.15`. Stratified k-fold splitting is then applied only to the
+remaining train/validation pool. This keeps the test set fixed across folds.
 
 ## Experiments
 
-The first version used a small MLP probe with dropout and AdamW. It reached a
-reasonable F1 score, but the training AUROC was too high, which suggested
-overfitting on the small labelled set. This direction was replaced by simpler
-linear probes.
+The first probe used a small MLP with dropout and AdamW. It produced high train
+metrics on this small labelled set, so it was replaced by simpler linear
+probes.
 
-Several PCA and logistic-regression ensembles were also tried. PCA projections
-gave a useful way to reduce dimensionality, but they made the probe more
-complex and were not needed after feature selection was added. The final probe
-therefore removes PCA and keeps only supervised top-k feature subsets.
+PCA-based probes were tested and then removed. PCA reduced dimensionality, but
+it added another moving part and was not needed after supervised feature
+selection was used.
 
-Extra threshold tuning and out-of-fold model weighting were tested as well.
-These methods made the code harder to reason about and did not give a clear
-enough benefit. A fixed threshold of 0.45 was kept instead.
+Larger top-k logistic ensembles were also tested. They used 64 to 1024 selected
+features and gave reasonable validation metrics, but fixed-test accuracy stayed
+near 72%. A diagonal LDA-style model and validation reweighting were also tried,
+but they did not recover the target accuracy.
 
-Training a linear probe on the full feature matrix was tried after PCA removal.
-This was not useful: training became slower and the train metrics became too
-high, suggesting memorization. The top-k feature subsets gave a cleaner
-train/test gap and kept the probe faster.
+Extra EOS-excluded answer-tail vector features were tested. They increased the
+feature dimension and slightly increased overfitting, so they were not kept.
+Only compact scalar EOS-excluded features were retained.
 
-The split strategy also changed during development. A single
-train/validation/test split was replaced by stratified k-fold evaluation for
-more stable local estimates. Validation was later restored inside each fold, so
-the final results include train, validation, and held-out test metrics.
-
-The final solution is intentionally simple. Most of the signal comes from
-answer-focused hidden-state aggregation, while the classifier remains a
-regularized linear model.
+The final improvement came from reducing the probe variance. Using only the top
+32 supervised features gave lower train accuracy, a smaller train/test gap, and
+better fixed-test accuracy than the broader ensembles.

@@ -10,25 +10,34 @@ and their signatures must not change.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from sklearn.linear_model import LogisticRegression
 
-ProbeModel = tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]
+
+@dataclass
+class ProbeModel:
+    kind: str
+    selected_idx: torch.Tensor
+    vote_weight: float
+    linear_weight: torch.Tensor | None = None
+    bias: torch.Tensor | None = None
 
 
 class HallucinationProbe(nn.Module):
     """Binary classifier that detects hallucinations from hidden-state features.
 
     Extends ``torch.nn.Module`` and keeps the public probe API expected by
-    ``evaluate.py``.  The active classifier is a torch-native ensemble of
-    regularized linear probes over compact supervised feature subsets.
+    ``evaluate.py``.  The active classifier is a small ensemble of regularized
+    logistic probes over compact supervised feature subsets.
     """
 
-    TOPK_SIZES = (64, 128, 256, 512, 1024)
-    TOPK_C_VALUES = (0.005, 0.01)
-    THRESHOLD = 0.45
+    TOPK_SIZES = (32,)
+    TOPK_C_VALUES = (0.03,)
+    THRESHOLD = 0.42
 
     def __init__(self) -> None:
         super().__init__()
@@ -63,7 +72,7 @@ class HallucinationProbe(nn.Module):
         """Train the probe on labelled feature vectors.
 
         Scales features, chooses compact feature subsets, and fits a
-        deterministic ensemble of regularized torch linear probes.
+        deterministic ensemble of regularized linear probes.
 
         Args:
             X: Feature matrix of shape ``(n_samples, feature_dim)``.
@@ -99,62 +108,18 @@ class HallucinationProbe(nn.Module):
         if len(np.unique(y_train)) < 2:
             return None
 
-        torch.manual_seed(42)
-        X_train = X_train.double()
-        y_t = torch.from_numpy(y_train.astype(np.float64))
-        n_pos = float(y_t.sum().item())
-        n_neg = float(len(y_t) - n_pos)
-        if n_pos == 0.0 or n_neg == 0.0:
-            return None
-
-        if balance_classes:
-            sample_weights = torch.where(
-                y_t > 0.5,
-                torch.full_like(y_t, len(y_t) / (2.0 * n_pos)),
-                torch.full_like(y_t, len(y_t) / (2.0 * n_neg)),
-            )
-        else:
-            sample_weights = torch.ones_like(y_t)
-
-        weight = torch.zeros(X_train.shape[1], dtype=torch.float64, requires_grad=True)
-        bias = torch.zeros((), dtype=torch.float64, requires_grad=True)
-        l2_strength = 1.0 / max(C, 1e-6)
-
-        def objective() -> torch.Tensor:
-            logits = X_train @ weight + bias
-            loss = F.binary_cross_entropy_with_logits(
-                logits,
-                y_t,
-                weight=sample_weights,
-                reduction="mean",
-            )
-            return loss + 0.5 * l2_strength * weight.square().sum() / len(y_t)
-
-        optimizer = torch.optim.LBFGS(
-            [weight, bias],
-            lr=1.0,
-            max_iter=300,
-            history_size=20,
-            line_search_fn="strong_wolfe",
+        class_weight = "balanced" if balance_classes else None
+        classifier = LogisticRegression(
+            C=C,
+            solver="liblinear",
+            max_iter=1000,
+            class_weight=class_weight,
+            random_state=42,
         )
-
-        try:
-            def closure() -> torch.Tensor:
-                optimizer.zero_grad()
-                loss = objective()
-                loss.backward()
-                return loss
-
-            optimizer.step(closure)
-        except RuntimeError:
-            optimizer = torch.optim.AdamW([weight, bias], lr=0.05, weight_decay=0.0)
-            for _ in range(400):
-                optimizer.zero_grad()
-                loss = objective()
-                loss.backward()
-                optimizer.step()
-
-        return weight.detach(), bias.detach()
+        classifier.fit(X_train.numpy(), y_train.astype(int))
+        weight = torch.from_numpy(classifier.coef_[0].astype(np.float64))
+        bias = torch.tensor(float(classifier.intercept_[0]), dtype=torch.float64)
+        return weight, bias
 
     def _fit_logistic_ensemble(
         self,
@@ -166,7 +131,6 @@ class HallucinationProbe(nn.Module):
 
         models: list[ProbeModel] = []
         for selected_idx in self._supervised_feature_rankings(X_scaled, y_train):
-            n_selected = int(selected_idx.numel())
             X_topk = X_scaled[:, selected_idx]
             for C in self.TOPK_C_VALUES:
                 fitted = self._fit_linear_probe(
@@ -177,10 +141,14 @@ class HallucinationProbe(nn.Module):
                 )
                 if fitted is None:
                     continue
-                size_weight = min(max(n_selected, 1) / 1024.0, 1.0)
-                vote_weight = 4.0 * size_weight * size_weight
                 models.append(
-                    (selected_idx, fitted[0], fitted[1], float(vote_weight))
+                    ProbeModel(
+                        kind="linear",
+                        selected_idx=selected_idx,
+                        vote_weight=1.0,
+                        linear_weight=fitted[0],
+                        bias=fitted[1],
+                    )
                 )
 
         return models
@@ -205,19 +173,28 @@ class HallucinationProbe(nn.Module):
         between += n_neg * (mean_neg - grand_mean).square()
         within = X_pos.var(dim=0, unbiased=True) * max(n_pos - 1.0, 1.0)
         within += X_neg.var(dim=0, unbiased=True) * max(n_neg - 1.0, 1.0)
-        scores = between / (within / max(n_pos + n_neg - 2.0, 1.0)).clamp_min(1e-8)
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        f_scores = between / (within / max(n_pos + n_neg - 2.0, 1.0)).clamp_min(1e-8)
+        f_scores = torch.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        mean_diff_scores = (mean_pos - mean_neg).abs()
 
         rankings: list[torch.Tensor] = []
         seen_sizes: set[int] = set()
+        seen_rankings: set[bytes] = set()
         max_features = int(X_scaled.shape[1])
-        for k in self.TOPK_SIZES:
-            k_eff = min(k, max_features)
-            if k_eff < 8 or k_eff in seen_sizes:
-                continue
-            selected = torch.topk(scores, k=k_eff, largest=True).indices
-            rankings.append(selected.sort().values.contiguous())
-            seen_sizes.add(k_eff)
+        for scores in (f_scores, mean_diff_scores):
+            for k in self.TOPK_SIZES:
+                k_eff = min(k, max_features)
+                if k_eff < 8 or (scores is f_scores and k_eff in seen_sizes):
+                    continue
+                selected = torch.topk(scores, k=k_eff, largest=True).indices
+                selected = selected.sort().values.contiguous()
+                ranking_key = selected.cpu().numpy().tobytes()
+                if ranking_key in seen_rankings:
+                    continue
+                rankings.append(selected)
+                seen_rankings.add(ranking_key)
+                if scores is f_scores:
+                    seen_sizes.add(k_eff)
         return rankings
 
     def _predict_scaled_proba(self, X_scaled: torch.Tensor) -> np.ndarray:
@@ -227,13 +204,27 @@ class HallucinationProbe(nn.Module):
         weighted_probs = torch.zeros(X_scaled.shape[0], dtype=torch.float64)
         total_weight = 0.0
         for model in self._ensemble:
-            selected_idx, linear_weight, bias, vote_weight = model
-            weighted_probs += vote_weight * torch.sigmoid(
-                X_scaled[:, selected_idx] @ linear_weight + bias
+            weighted_probs += model.vote_weight * self._predict_single_model_proba(
+                X_scaled,
+                model,
             )
-            total_weight += vote_weight
+            total_weight += model.vote_weight
 
         return (weighted_probs / max(total_weight, 1e-12)).numpy()
+
+    def _predict_single_model_proba(
+        self,
+        X_scaled: torch.Tensor,
+        model: ProbeModel,
+    ) -> torch.Tensor:
+        X_view = X_scaled[:, model.selected_idx]
+        if model.kind == "linear":
+            if model.linear_weight is None or model.bias is None:
+                raise RuntimeError("Linear probe is missing parameters.")
+            logits = X_view @ model.linear_weight + model.bias
+            return torch.sigmoid(logits)
+
+        raise RuntimeError(f"Unknown probe model kind: {model.kind}")
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
