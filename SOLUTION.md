@@ -33,20 +33,22 @@ The table reports the values from `results.json`.
 | Number of folds | 6 |
 | Split size per fold | 487-488 train / 97-98 val / 104 test |
 | Feature dimension | 48,849 |
-| Feature extraction time | 71.50 s |
+| Feature extraction time | 12.10 s |
 | Baseline accuracy | 70.19% |
 | Baseline F1 | 82.49% |
-| Train accuracy | 78.84% |
-| Train F1 | 85.93% |
-| Train AUROC | 83.17% |
-| Validation accuracy | 73.85% |
-| Validation F1 | 82.58% |
-| Validation AUROC | 75.55% |
-| Test accuracy | 76.28% |
-| Test F1 | 83.80% |
-| Test AUROC | 73.35% |
+| Train accuracy | 78.91% |
+| Train F1 | 85.99% |
+| Train AUROC | 82.88% |
+| Validation accuracy | 74.35% |
+| Validation F1 | 82.92% |
+| Validation AUROC | 75.35% |
+| Test accuracy | 75.96% |
+| Test F1 | 83.66% |
+| Test AUROC | 73.48% |
 
-The test accuracy across folds ranges from 70.19% to 78.85%.
+The test accuracy across folds ranges from 68.27% to 77.88%.
+
+The link to predictions: https://drive.google.com/drive/folders/1qI8UhmH-D9_NXAYAMwktzMr3liP_itxf?usp=drive_link
 
 ## Method
 
@@ -56,8 +58,7 @@ Only the three allowed files were changed: `aggregation.py`, `probe.py`, and
 In `aggregation.py`, hidden states are taken from layers 4, 8, 12, 16, 20, and
 the last layer. For each layer, several answer-focused vectors are
 concatenated: the last token, means over the last 4/8/16/32 tokens, the full
-mean, a recency-weighted mean, and two difference vectors. This keeps the
-representation focused on the response tail without using PCA.
+mean, a recency-weighted mean, and two difference vectors.
 
 Scalar geometric features are also added. These include sequence length,
 truncation, activation norms, cosine similarities between pooled vectors,
