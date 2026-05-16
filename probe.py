@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import StratifiedKFold
 
+ProbeModel = tuple[str, torch.Tensor | None, torch.Tensor, torch.Tensor, float, str]
+
 
 class HallucinationProbe(nn.Module):
     """Binary classifier that detects hallucinations from hidden-state features.
@@ -31,10 +33,12 @@ class HallucinationProbe(nn.Module):
         self._mean: torch.Tensor | None = None
         self._std: torch.Tensor | None = None
         self._pca_basis: torch.Tensor | None = None
-        self._ensemble: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
+        self._ensemble: list[ProbeModel] = []
+        self._model_weight_by_tag: dict[str, float] = {}
         self._train_prior: float = 0.5
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
         self._oof_threshold: float = 0.5
+        self._accuracy_anchor_threshold: float = 0.45
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
@@ -99,9 +103,14 @@ class HallucinationProbe(nn.Module):
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
+        self._model_weight_by_tag = {}
         self._oof_threshold = self._fit_oof_threshold(X_scaled, y_int)
-        self._threshold = self._oof_threshold
-        self._ensemble = self._fit_logistic_ensemble(X_scaled, y_int)
+        self._threshold = self._accuracy_anchor_threshold
+        self._ensemble = self._fit_logistic_ensemble(
+            X_scaled,
+            y_int,
+            self._model_weight_by_tag,
+        )
         # ------------------------------------------------------------------
 
         self.eval()
@@ -179,6 +188,7 @@ class HallucinationProbe(nn.Module):
         X_train: torch.Tensor,
         y_train: np.ndarray,
         C: float = 0.25,
+        balance_classes: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if len(np.unique(y_train)) < 2:
             return None
@@ -191,11 +201,14 @@ class HallucinationProbe(nn.Module):
         if n_pos == 0.0 or n_neg == 0.0:
             return None
 
-        sample_weights = torch.where(
-            y_t > 0.5,
-            torch.full_like(y_t, len(y_t) / (2.0 * n_pos)),
-            torch.full_like(y_t, len(y_t) / (2.0 * n_neg)),
-        )
+        if balance_classes:
+            sample_weights = torch.where(
+                y_t > 0.5,
+                torch.full_like(y_t, len(y_t) / (2.0 * n_pos)),
+                torch.full_like(y_t, len(y_t) / (2.0 * n_neg)),
+            )
+        else:
+            sample_weights = torch.ones_like(y_t)
 
         weight = torch.zeros(X_view.shape[1], dtype=torch.float64, requires_grad=True)
         bias = torch.zeros((), dtype=torch.float64, requires_grad=True)
@@ -241,14 +254,15 @@ class HallucinationProbe(nn.Module):
         self,
         X_scaled: torch.Tensor,
         y_train: np.ndarray,
-    ) -> list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]]:
-        """Fit several regularized logistic probes on stable low-rank views."""
+        model_weight_by_tag: dict[str, float] | None = None,
+    ) -> list[ProbeModel]:
+        """Fit regularized logistic probes on PCA and supervised feature views."""
         if len(np.unique(y_train)) < 2:
             return []
 
-        models: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]] = []
+        models: list[ProbeModel] = []
         max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
-        component_grid = [16, 32, 64, 96, 128, 192, 256]
+        component_grid = [16, 32, 64, 96, 128]
         max_pca_components = min(max(component_grid), max_components)
 
         if max_pca_components >= 2:
@@ -263,22 +277,93 @@ class HallucinationProbe(nn.Module):
                 continue
             basis = self._pca_basis[:, :n_components].contiguous()
             X_pca = X_scaled @ basis
-            for C in (0.03, 0.06, 0.12, 0.25, 0.5, 1.0):
+            for C in (0.02, 0.04, 0.08, 0.16, 0.32):
                 fitted = self._fit_linear_probe(X_pca, y_train, C=C)
                 if fitted is not None:
                     # Lower-dimensional views are less brittle on this small
                     # dataset, so give them a modestly higher vote.
-                    vote_weight = 1.0 / np.sqrt(n_components / component_grid[0])
-                    models.append((basis, fitted[0], fitted[1], float(vote_weight)))
+                    tag = f"pca{n_components}_c{C:g}"
+                    vote_weight = 0.05 / np.sqrt(n_components / component_grid[0])
+                    vote_weight *= (model_weight_by_tag or {}).get(tag, 1.0)
+                    models.append(
+                        ("pca", basis, fitted[0], fitted[1], float(vote_weight), tag)
+                    )
+
+        for selected_idx in self._supervised_feature_rankings(X_scaled, y_train):
+            n_selected = int(selected_idx.numel())
+            X_topk = X_scaled[:, selected_idx]
+            for C in (0.005, 0.01):
+                fitted = self._fit_linear_probe(
+                    X_topk,
+                    y_train,
+                    C=C,
+                    balance_classes=False,
+                )
+                if fitted is None:
+                    continue
+                tag = f"top{n_selected}_c{C:g}_unweighted"
+                size_weight = min(max(n_selected, 1) / 1024.0, 1.0)
+                vote_weight = 4.0 * size_weight * size_weight
+                vote_weight *= (model_weight_by_tag or {}).get(tag, 1.0)
+                models.append(
+                    (
+                        "select",
+                        selected_idx,
+                        fitted[0],
+                        fitted[1],
+                        float(vote_weight),
+                        tag,
+                    )
+                )
 
         # The raw full-dimensional solve is useful for compact features but
         # expensive and brittle once aggregation exposes many layer views.
         if X_scaled.shape[1] <= 15000:
             fitted_raw = self._fit_linear_probe(X_scaled, y_train, C=0.05)
             if fitted_raw is not None:
-                models.append((None, fitted_raw[0], fitted_raw[1], 0.35))
+                tag = "raw_c0.05"
+                vote_weight = 0.35 * (model_weight_by_tag or {}).get(tag, 1.0)
+                models.append(
+                    ("raw", None, fitted_raw[0], fitted_raw[1], vote_weight, tag)
+                )
 
         return models
+
+    def _supervised_feature_rankings(
+        self,
+        X_scaled: torch.Tensor,
+        y_train: np.ndarray,
+    ) -> list[torch.Tensor]:
+        """Rank features by train-fold class separation and return top-k views."""
+        y_t = torch.from_numpy(y_train.astype(bool))
+        if y_t.sum() == 0 or (~y_t).sum() == 0:
+            return []
+
+        X_pos = X_scaled[y_t]
+        X_neg = X_scaled[~y_t]
+        n_pos = float(X_pos.shape[0])
+        n_neg = float(X_neg.shape[0])
+        mean_pos = X_pos.mean(dim=0)
+        mean_neg = X_neg.mean(dim=0)
+        grand_mean = X_scaled.mean(dim=0)
+        between = n_pos * (mean_pos - grand_mean).square()
+        between += n_neg * (mean_neg - grand_mean).square()
+        within = X_pos.var(dim=0, unbiased=True) * max(n_pos - 1.0, 1.0)
+        within += X_neg.var(dim=0, unbiased=True) * max(n_neg - 1.0, 1.0)
+        scores = between / (within / max(n_pos + n_neg - 2.0, 1.0)).clamp_min(1e-8)
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+        rankings: list[torch.Tensor] = []
+        seen_sizes: set[int] = set()
+        max_features = int(X_scaled.shape[1])
+        for k in (64, 128, 256, 512, 1024):
+            k_eff = min(k, max_features)
+            if k_eff < 8 or k_eff in seen_sizes:
+                continue
+            selected = torch.topk(scores, k=k_eff, largest=True).indices
+            rankings.append(selected.sort().values.contiguous())
+            seen_sizes.add(k_eff)
+        return rankings
 
     def _compute_pca_basis(self, X_scaled: torch.Tensor, n_components: int) -> torch.Tensor:
         X_centered = X_scaled - X_scaled.mean(dim=0, keepdim=True)
@@ -305,7 +390,7 @@ class HallucinationProbe(nn.Module):
     def _predict_ensemble_proba(
         self,
         X_scaled: torch.Tensor,
-        ensemble: list[tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float]],
+        ensemble: list[ProbeModel],
         fallback_prior: float,
     ) -> np.ndarray:
         if not ensemble:
@@ -313,12 +398,32 @@ class HallucinationProbe(nn.Module):
 
         weighted_probs = torch.zeros(X_scaled.shape[0], dtype=torch.float64)
         total_weight = 0.0
-        for basis, linear_weight, bias, vote_weight in ensemble:
-            X_view = X_scaled @ basis if basis is not None else X_scaled
-            weighted_probs += vote_weight * torch.sigmoid(X_view @ linear_weight + bias)
+        for model in ensemble:
+            vote_weight = model[4]
+            weighted_probs += vote_weight * torch.from_numpy(
+                self._predict_single_model_proba(X_scaled, model)
+            )
             total_weight += vote_weight
 
         return (weighted_probs / max(total_weight, 1e-12)).numpy()
+
+    def _predict_single_model_proba(
+        self,
+        X_scaled: torch.Tensor,
+        model: ProbeModel,
+    ) -> np.ndarray:
+        view_kind, transform, linear_weight, bias, _, _ = model
+        if view_kind == "pca":
+            if transform is None:
+                raise RuntimeError("PCA model is missing its basis.")
+            X_view = X_scaled @ transform
+        elif view_kind == "select":
+            if transform is None:
+                raise RuntimeError("Selected-feature model is missing indices.")
+            X_view = X_scaled[:, transform.long()]
+        else:
+            X_view = X_scaled
+        return torch.sigmoid(X_view @ linear_weight + bias).numpy()
 
     def _prior_threshold(self, probs: np.ndarray, prior: float) -> float:
         if probs.size == 0:
@@ -341,18 +446,40 @@ class HallucinationProbe(nn.Module):
         candidates = np.unique(np.concatenate([probs, np.linspace(0.02, 0.98, 97)]))
         if reference_threshold is None:
             reference_threshold = self._prior_threshold(probs, self._train_prior)
+        candidates = np.unique(
+            np.concatenate(
+                [
+                    candidates,
+                    np.array(
+                        [
+                            reference_threshold,
+                            self._prior_threshold(probs, self._train_prior),
+                            np.quantile(probs, 0.25),
+                            np.quantile(probs, 0.50),
+                            np.quantile(probs, 0.75),
+                        ],
+                        dtype=float,
+                    ),
+                ]
+            )
+        )
 
         best_accuracy = -1.0
-        scores: list[tuple[float, float]] = []
+        scores: list[tuple[float, float, float]] = []
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
             acc = self._accuracy(y_true, y_pred_t)
+            pos_rate = float(np.mean(y_pred_t))
             best_accuracy = max(best_accuracy, acc)
-            scores.append((float(t), acc))
+            scores.append((float(t), acc, pos_rate))
 
-        best_threshold, _ = max(
+        best_threshold, _, _ = max(
             scores,
-            key=lambda item: (item[1], -abs(item[0] - reference_threshold)),
+            key=lambda item: (
+                item[1],
+                -abs(item[2] - self._train_prior),
+                -abs(item[0] - reference_threshold),
+            ),
         )
         return float(best_threshold)
 
@@ -362,7 +489,8 @@ class HallucinationProbe(nn.Module):
         if n_splits < 2 or len(y_train) < 8:
             return 0.5
 
-        oof_probs = np.full(len(y_train), self._train_prior, dtype=float)
+        model_oof_probs: dict[str, np.ndarray] = {}
+        model_base_weights: dict[str, float] = {}
         splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
         for inner_train_idx, inner_val_idx in splitter.split(
@@ -374,11 +502,46 @@ class HallucinationProbe(nn.Module):
                 X_scaled[inner_train_idx],
                 y_train[inner_train_idx],
             )
-            oof_probs[inner_val_idx] = self._predict_ensemble_proba(
-                X_scaled[inner_val_idx],
-                inner_ensemble,
-                inner_prior,
+            for model in inner_ensemble:
+                tag = model[5]
+                if tag not in model_oof_probs:
+                    model_oof_probs[tag] = np.full(len(y_train), np.nan, dtype=float)
+                    model_base_weights[tag] = model[4]
+                model_oof_probs[tag][inner_val_idx] = self._predict_single_model_proba(
+                    X_scaled[inner_val_idx],
+                    model,
+                )
+
+        baseline_accuracy = max(self._train_prior, 1.0 - self._train_prior)
+        model_weight_by_tag: dict[str, float] = {}
+        weighted_oof = np.zeros(len(y_train), dtype=float)
+        total_weight = 0.0
+        for tag, probs in model_oof_probs.items():
+            if np.isnan(probs).any():
+                continue
+            prior_threshold = self._prior_threshold(probs, self._train_prior)
+            model_threshold = self._best_threshold(
+                probs,
+                y_train,
+                reference_threshold=prior_threshold,
             )
+            model_accuracy = self._accuracy(y_train, probs >= model_threshold)
+            excess_accuracy = model_accuracy - baseline_accuracy
+            multiplier = 0.25 if excess_accuracy <= 0.0 else 0.75 + min(
+                2.0,
+                10.0 * excess_accuracy,
+            )
+            model_weight_by_tag[tag] = float(multiplier)
+            weighted_model_weight = model_base_weights[tag] * multiplier
+            weighted_oof += weighted_model_weight * probs
+            total_weight += weighted_model_weight
+
+        if total_weight <= 1e-12:
+            oof_probs = np.full(len(y_train), self._train_prior, dtype=float)
+            self._model_weight_by_tag = {}
+        else:
+            oof_probs = weighted_oof / total_weight
+            self._model_weight_by_tag = model_weight_by_tag
 
         prior_threshold = self._prior_threshold(oof_probs, self._train_prior)
         return self._best_threshold(
