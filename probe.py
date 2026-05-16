@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-ProbeModel = tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, float]
+ProbeModel = tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]
 
 
 class HallucinationProbe(nn.Module):
@@ -23,11 +23,9 @@ class HallucinationProbe(nn.Module):
 
     Extends ``torch.nn.Module`` and keeps the public probe API expected by
     ``evaluate.py``.  The active classifier is a torch-native ensemble of
-    regularized linear probes over scaled PCA and selected feature views.
+    regularized linear probes over compact supervised feature subsets.
     """
 
-    PCA_COMPONENTS = (16, 32, 64, 96, 128)
-    PCA_C_VALUES = (0.02, 0.04, 0.08, 0.16, 0.32)
     TOPK_SIZES = (64, 128, 256, 512, 1024)
     TOPK_C_VALUES = (0.005, 0.01)
     THRESHOLD = 0.45
@@ -36,7 +34,6 @@ class HallucinationProbe(nn.Module):
         super().__init__()
         self._mean: torch.Tensor | None = None
         self._std: torch.Tensor | None = None
-        self._pca_basis: torch.Tensor | None = None
         self._ensemble: list[ProbeModel] = []
         self._train_prior: float = 0.5
         self._threshold: float = self.THRESHOLD
@@ -65,8 +62,8 @@ class HallucinationProbe(nn.Module):
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
 
-        Scales features, builds PCA views, and fits a deterministic ensemble of
-        regularized torch linear probes.
+        Scales features, chooses compact feature subsets, and fits a
+        deterministic ensemble of regularized torch linear probes.
 
         Args:
             X: Feature matrix of shape ``(n_samples, feature_dim)``.
@@ -103,7 +100,7 @@ class HallucinationProbe(nn.Module):
             return None
 
         torch.manual_seed(42)
-        X_view = X_train.double()
+        X_train = X_train.double()
         y_t = torch.from_numpy(y_train.astype(np.float64))
         n_pos = float(y_t.sum().item())
         n_neg = float(len(y_t) - n_pos)
@@ -119,12 +116,12 @@ class HallucinationProbe(nn.Module):
         else:
             sample_weights = torch.ones_like(y_t)
 
-        weight = torch.zeros(X_view.shape[1], dtype=torch.float64, requires_grad=True)
+        weight = torch.zeros(X_train.shape[1], dtype=torch.float64, requires_grad=True)
         bias = torch.zeros((), dtype=torch.float64, requires_grad=True)
         l2_strength = 1.0 / max(C, 1e-6)
 
         def objective() -> torch.Tensor:
-            logits = X_view @ weight + bias
+            logits = X_train @ weight + bias
             loss = F.binary_cross_entropy_with_logits(
                 logits,
                 y_t,
@@ -168,29 +165,6 @@ class HallucinationProbe(nn.Module):
             return []
 
         models: list[ProbeModel] = []
-        max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
-        max_pca_components = min(max(self.PCA_COMPONENTS), max_components)
-
-        if max_pca_components >= 2:
-            self._pca_basis = self._compute_pca_basis(X_scaled, max_pca_components)
-        else:
-            self._pca_basis = None
-
-        if self._pca_basis is not None:
-            for n_components in self.PCA_COMPONENTS:
-                if n_components < 2 or n_components > max_components:
-                    continue
-                basis = self._pca_basis[:, :n_components].contiguous()
-                X_pca = X_scaled @ basis
-                for C in self.PCA_C_VALUES:
-                    fitted = self._fit_linear_probe(X_pca, y_train, C=C)
-                    if fitted is None:
-                        continue
-                    vote_weight = 0.05 / np.sqrt(n_components / self.PCA_COMPONENTS[0])
-                    models.append(
-                        ("pca", basis, fitted[0], fitted[1], float(vote_weight))
-                    )
-
         for selected_idx in self._supervised_feature_rankings(X_scaled, y_train):
             n_selected = int(selected_idx.numel())
             X_topk = X_scaled[:, selected_idx]
@@ -206,7 +180,7 @@ class HallucinationProbe(nn.Module):
                 size_weight = min(max(n_selected, 1) / 1024.0, 1.0)
                 vote_weight = 4.0 * size_weight * size_weight
                 models.append(
-                    ("select", selected_idx, fitted[0], fitted[1], float(vote_weight))
+                    (selected_idx, fitted[0], fitted[1], float(vote_weight))
                 )
 
         return models
@@ -246,11 +220,6 @@ class HallucinationProbe(nn.Module):
             seen_sizes.add(k_eff)
         return rankings
 
-    def _compute_pca_basis(self, X_scaled: torch.Tensor, n_components: int) -> torch.Tensor:
-        X_centered = X_scaled - X_scaled.mean(dim=0, keepdim=True)
-        _, _, vh = torch.linalg.svd(X_centered, full_matrices=False)
-        return vh[:n_components].T.contiguous()
-
     def _predict_scaled_proba(self, X_scaled: torch.Tensor) -> np.ndarray:
         if not self._ensemble:
             return np.full(X_scaled.shape[0], self._train_prior, dtype=float)
@@ -258,27 +227,13 @@ class HallucinationProbe(nn.Module):
         weighted_probs = torch.zeros(X_scaled.shape[0], dtype=torch.float64)
         total_weight = 0.0
         for model in self._ensemble:
-            vote_weight = model[4]
-            weighted_probs += vote_weight * torch.from_numpy(
-                self._predict_single_model_proba(X_scaled, model)
+            selected_idx, linear_weight, bias, vote_weight = model
+            weighted_probs += vote_weight * torch.sigmoid(
+                X_scaled[:, selected_idx] @ linear_weight + bias
             )
             total_weight += vote_weight
 
         return (weighted_probs / max(total_weight, 1e-12)).numpy()
-
-    def _predict_single_model_proba(
-        self,
-        X_scaled: torch.Tensor,
-        model: ProbeModel,
-    ) -> np.ndarray:
-        view_kind, transform, linear_weight, bias, _ = model
-        if view_kind == "pca":
-            X_view = X_scaled @ transform
-        elif view_kind == "select":
-            X_view = X_scaled[:, transform.long()]
-        else:
-            raise RuntimeError(f"Unknown probe view kind: {view_kind}")
-        return torch.sigmoid(X_view @ linear_weight + bias).numpy()
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
