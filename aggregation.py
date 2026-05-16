@@ -18,6 +18,48 @@ single entry point called from the notebook.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+
+def selected_layer_indices(n_layers: int) -> list[int]:
+    """Return stable cross-depth layer indices for a hidden-state stack."""
+    candidates = [4, 8, 12, 16, 20, n_layers - 1]
+    indices: list[int] = []
+    for idx in candidates:
+        idx = max(0, min(n_layers - 1, idx))
+        if idx not in indices:
+            indices.append(idx)
+    return indices
+
+
+def real_token_slice(attention_mask: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Return real-token positions and the final real-token index."""
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    if real_positions.numel() == 0:
+        real_positions = torch.tensor([0], device=attention_mask.device)
+    return real_positions, int(real_positions[-1].item())
+
+
+def content_token_positions(real_positions: torch.Tensor) -> torch.Tensor:
+    """Return real-token positions excluding the final token when possible."""
+    if real_positions.numel() <= 1:
+        return real_positions
+    return real_positions[:-1]
+
+
+def recency_weighted_mean(layer_tokens: torch.Tensor) -> torch.Tensor:
+    """Pool tokens with a smooth bias toward the answer tail."""
+    if layer_tokens.size(0) == 1:
+        return layer_tokens[0]
+    weights = torch.linspace(
+        0.25,
+        1.0,
+        steps=layer_tokens.size(0),
+        dtype=layer_tokens.dtype,
+        device=layer_tokens.device,
+    )
+    weights = weights / weights.sum().clamp_min(1e-12)
+    return (layer_tokens * weights[:, None]).sum(dim=0)
 
 
 def aggregate(
@@ -45,16 +87,39 @@ def aggregate(
     # STUDENT: Replace or extend the aggregation below.
     # ------------------------------------------------------------------
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    real_positions, last_pos = real_token_slice(attention_mask)
+    real_positions = real_positions.to(hidden_states.device)
+    tail4_positions = real_positions[-4:]
+    tail8_positions = real_positions[-8:]
+    tail16_positions = real_positions[-16:]
+    tail32_positions = real_positions[-32:]
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    features = []
+    for layer_idx in selected_layer_indices(hidden_states.size(0)):
+        layer = hidden_states[layer_idx].float()
+        real_tokens = layer[real_positions]
+        last_token = layer[last_pos]
+        tail4_mean = layer[tail4_positions].mean(dim=0)
+        tail8_mean = layer[tail8_positions].mean(dim=0)
+        tail16_mean = layer[tail16_positions].mean(dim=0)
+        tail32_mean = layer[tail32_positions].mean(dim=0)
+        full_mean = real_tokens.mean(dim=0)
+        recency_mean = recency_weighted_mean(real_tokens)
+        features.extend(
+            [
+                last_token,
+                tail4_mean,
+                tail8_mean,
+                tail16_mean,
+                tail32_mean,
+                full_mean,
+                recency_mean,
+                last_token - tail32_mean,
+                recency_mean - full_mean,
+            ]
+        )
 
-    feature = layer[last_pos]          # (hidden_dim,)
-
-    return feature
+    return torch.cat(features, dim=0)
     # ------------------------------------------------------------------
 
 
@@ -85,8 +150,165 @@ def extract_geometric_features(
     # STUDENT: Replace or extend the geometric feature extraction below.
     # ------------------------------------------------------------------
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    real_positions, last_pos = real_token_slice(attention_mask)
+    real_positions = real_positions.to(hidden_states.device)
+    content_positions = content_token_positions(real_positions)
+    penultimate_pos = int(content_positions[-1].item())
+    tail4_positions = real_positions[-4:]
+    tail8_positions = real_positions[-8:]
+    tail16_positions = real_positions[-16:]
+    tail32_positions = real_positions[-32:]
+    content_tail4_positions = content_positions[-4:]
+    content_tail8_positions = content_positions[-8:]
+    content_tail16_positions = content_positions[-16:]
+    selected = selected_layer_indices(hidden_states.size(0))
+
+    real_len = float(real_positions.numel())
+    max_model_len = 512.0
+    is_truncated = float(real_len >= max_model_len)
+    features = [
+        torch.tensor(
+            real_len / max_model_len,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.tensor(
+            is_truncated,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.log1p(
+            torch.tensor(real_len, dtype=torch.float32, device=hidden_states.device)
+        ),
+        torch.tensor(
+            min(real_len, 8.0) / max(real_len, 1.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.tensor(
+            min(real_len, 32.0) / max(real_len, 1.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+    ]
+
+    last_vectors = []
+    all_last_vectors = []
+    all_tail_means = []
+    all_full_means = []
+    for layer_idx in selected:
+        layer = hidden_states[layer_idx, real_positions].float()
+        full_layer = hidden_states[layer_idx].float()
+        last_token = full_layer[last_pos]
+        penultimate_token = full_layer[penultimate_pos]
+        tail4 = full_layer[tail4_positions]
+        tail8 = full_layer[tail8_positions]
+        tail16 = full_layer[tail16_positions]
+        tail32 = full_layer[tail32_positions]
+        content_tail4 = full_layer[content_tail4_positions]
+        content_tail8 = full_layer[content_tail8_positions]
+        content_tail16 = full_layer[content_tail16_positions]
+        tail4_mean = tail4.mean(dim=0)
+        tail8_mean = tail8.mean(dim=0)
+        tail16_mean = tail16.mean(dim=0)
+        tail32_mean = tail32.mean(dim=0)
+        content_tail4_mean = content_tail4.mean(dim=0)
+        content_tail8_mean = content_tail8.mean(dim=0)
+        content_tail16_mean = content_tail16.mean(dim=0)
+        full_mean = layer.mean(dim=0)
+        recency_mean = recency_weighted_mean(layer)
+        token_norms = layer.norm(dim=1)
+        tail4_norms = tail4.norm(dim=1)
+        tail8_norms = tail8.norm(dim=1)
+        tail16_norms = tail16.norm(dim=1)
+        tail32_norms = tail32.norm(dim=1)
+        content_tail4_norms = content_tail4.norm(dim=1)
+        content_tail8_norms = content_tail8.norm(dim=1)
+        content_tail16_norms = content_tail16.norm(dim=1)
+
+        features.append(token_norms.mean())
+        features.append(token_norms.std(unbiased=False))
+        features.append(last_token.norm())
+        features.append(tail4_norms.mean())
+        features.append(tail4_norms.std(unbiased=False))
+        features.append(tail8_norms.mean())
+        features.append(tail8_norms.std(unbiased=False))
+        features.append(tail16_norms.mean())
+        features.append(tail16_norms.std(unbiased=False))
+        features.append(tail32_norms.mean())
+        features.append(tail32_norms.std(unbiased=False))
+        features.append(F.cosine_similarity(last_token, tail4_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, tail8_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, tail16_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(last_token, recency_mean, dim=0))
+        features.append(F.cosine_similarity(tail4_mean, tail8_mean, dim=0))
+        features.append(F.cosine_similarity(tail8_mean, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(tail16_mean, tail32_mean, dim=0))
+        features.append(F.cosine_similarity(tail32_mean, full_mean, dim=0))
+        features.append(F.cosine_similarity(recency_mean, full_mean, dim=0))
+        features.append((tail4_mean - full_mean).norm())
+        features.append((tail8_mean - full_mean).norm())
+        features.append((tail16_mean - full_mean).norm())
+        features.append((tail32_mean - full_mean).norm())
+        features.append((recency_mean - full_mean).norm())
+        features.append((tail4_mean - tail32_mean).norm())
+        features.append((last_token - tail4_mean).norm())
+        features.append(penultimate_token.norm())
+        features.append(content_tail4_norms.mean())
+        features.append(content_tail8_norms.mean())
+        features.append(content_tail16_norms.mean())
+        features.append(F.cosine_similarity(penultimate_token, content_tail4_mean, dim=0))
+        features.append(F.cosine_similarity(penultimate_token, content_tail8_mean, dim=0))
+        features.append(F.cosine_similarity(penultimate_token, content_tail16_mean, dim=0))
+        features.append(F.cosine_similarity(content_tail8_mean, full_mean, dim=0))
+        features.append((penultimate_token - content_tail16_mean).norm())
+        features.append((content_tail8_mean - full_mean).norm())
+        last_vectors.append(last_token)
+
+    for left, right in zip(last_vectors, last_vectors[1:]):
+        features.append(F.cosine_similarity(left, right, dim=0))
+
+    for layer_idx in range(hidden_states.size(0)):
+        layer = hidden_states[layer_idx].float()
+        real_tokens = layer[real_positions]
+        tail32_mean = layer[tail32_positions].mean(dim=0)
+        full_mean = real_tokens.mean(dim=0)
+        last_token = layer[last_pos]
+
+        features.append(last_token.norm())
+        features.append(tail32_mean.norm())
+        features.append(full_mean.norm())
+        features.append(F.cosine_similarity(last_token, tail32_mean, dim=0))
+        features.append((last_token - tail32_mean).norm())
+
+        all_last_vectors.append(last_token)
+        all_tail_means.append(tail32_mean)
+        all_full_means.append(full_mean)
+
+    middle_idx = len(all_last_vectors) // 2
+    final_last = all_last_vectors[-1]
+    middle_last = all_last_vectors[middle_idx]
+    final_tail = all_tail_means[-1]
+    middle_tail = all_tail_means[middle_idx]
+    final_full = all_full_means[-1]
+    middle_full = all_full_means[middle_idx]
+    features.append(F.cosine_similarity(final_last, middle_last, dim=0))
+    features.append(F.cosine_similarity(final_tail, middle_tail, dim=0))
+    features.append(F.cosine_similarity(final_full, middle_full, dim=0))
+    features.append((final_last - middle_last).norm())
+    features.append((final_tail - middle_tail).norm())
+    features.append((final_full - middle_full).norm())
+
+    for left, right in zip(all_last_vectors, all_last_vectors[1:]):
+        features.append(F.cosine_similarity(left, right, dim=0))
+        features.append((right - left).norm())
+
+    for left, right in zip(all_tail_means, all_tail_means[1:]):
+        features.append(F.cosine_similarity(left, right, dim=0))
+        features.append((right - left).norm())
+
+    return torch.stack(features).float()
 
 
 def aggregation_and_feature_extraction(
