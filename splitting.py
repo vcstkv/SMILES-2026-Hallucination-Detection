@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
 def split_data(
@@ -30,8 +30,8 @@ def split_data(
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
     """Split dataset indices into train, validation, and test subsets.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    The default strategy performs shuffled stratified K-fold evaluation and
+    carves a non-empty stratified validation set out of each training fold.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
@@ -44,7 +44,8 @@ def split_data(
 
     Returns:
         A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
+        arrays.  ``idx_val`` is populated whenever there are enough labelled
+        samples to stratify a validation split.
 
     Student task:
         Replace or extend the skeleton below.  The only contract is that the
@@ -65,7 +66,18 @@ def split_data(
     )
 
     splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
-    for idx_train, idx_test in splitter.split(idx, y):
-        splits.append((idx_train, None, idx_test))
+    for fold_idx, (idx_train_val, idx_test) in enumerate(splitter.split(idx, y)):
+        y_train_val = y[idx_train_val]
+        val_fraction = val_size / (1.0 - (1.0 / n_splits))
+        val_fraction = min(max(val_fraction, 1.0 / len(idx_train_val)), 0.5)
+
+        idx_train, idx_val = train_test_split(
+            idx_train_val,
+            test_size=val_fraction,
+            random_state=random_state + fold_idx,
+            shuffle=True,
+            stratify=y_train_val,
+        )
+        splits.append((idx_train, idx_val, idx_test))
 
     return splits
